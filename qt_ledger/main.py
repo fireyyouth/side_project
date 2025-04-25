@@ -3,21 +3,31 @@ import sqlite3
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QTabWidget,
     QTableWidget, QTableWidgetItem, QHBoxLayout, QLineEdit, QFormLayout,
-    QDialog, QDialogButtonBox, QLabel, QSpinBox, QMessageBox, QDateTimeEdit, QComboBox, QHeaderView, QFrame
+    QDialog, QDialogButtonBox, QLabel, QMessageBox, QDateTimeEdit, QComboBox, 
+    QHeaderView, QFrame, QTreeWidget, QTreeWidgetItem, QSizePolicy, QSpacerItem,
+    QFileDialog
 )
-from PySide6.QtGui import QDoubleValidator
+from PySide6.QtGui import QDoubleValidator, QFont
 from PySide6.QtCore import Qt
 from PySide6.QtCore import QDateTime
 from collections import defaultdict
 from functools import partial
 import decimal
-
-ITEMS_PER_PAGE = 10
+import sys
+import openpyxl
 
 conn = sqlite3.connect("ledger.db")
 cursor = conn.cursor()
 
-def init_db():
+def init_db(drop):
+    cursor.execute("PRAGMA foreign_keys = ON")
+
+    if drop:
+        cursor.execute("DROP TABLE IF EXISTS person")
+        cursor.execute("DROP TABLE IF EXISTS project")
+        cursor.execute("DROP TABLE IF EXISTS sub_project")
+        cursor.execute("DROP TABLE IF EXISTS transfer")
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS person (
             name TEXT NOT NULL,
@@ -31,13 +41,23 @@ def init_db():
         )
     """)
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sub_project (
+            name TEXT NOT NULL,
+            parent TEXT NOT NULL,
+            UNIQUE(name, parent),
+            FOREIGN KEY (parent) REFERENCES project(name) ON DELETE CASCADE
+        )
+    """)
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS transfer (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             time TEXT NOT NULL,
             person TEXT,
             project TEXT,
+            sub_project TEXT,
             kind TEXT,
-            amount TEXT
+            amount TEXT,
+            memo TEXT
         )
     """)
     conn.commit()
@@ -50,6 +70,13 @@ def get_project():
     cursor.execute("SELECT name FROM project")
     return [item[0] for item in cursor.fetchall()]
 
+def get_sub_project(parent=None):
+    if parent:
+        cursor.execute("SELECT name, parent FROM sub_project WHERE parent = ?", (parent,))
+    else:
+        cursor.execute("SELECT name, parent FROM sub_project")
+    return cursor.fetchall()
+
 def add_person(name):
     if name:
         cursor.execute("INSERT INTO person (name) VALUES (?)", (name,))
@@ -60,6 +87,11 @@ def add_project(name):
         cursor.execute("INSERT INTO project (name) VALUES (?)", (name,))
         conn.commit()
 
+def add_sub_project(name, parent):
+    if name:
+        cursor.execute("INSERT INTO sub_project (name, parent) VALUES (?, ?)", (name, parent))
+        conn.commit()
+
 def delete_person(person):
     cursor.execute("DELETE FROM person WHERE name=?", (person,))
     conn.commit()
@@ -68,69 +100,85 @@ def delete_project(project):
     cursor.execute("DELETE FROM project WHERE name=?", (project,))
     conn.commit()
 
+
+def delete_sub_project(project):
+    cursor.execute("DELETE FROM sub_project WHERE name=?", (project,))
+    conn.commit()
+
+
 class BalanceError(Exception):
     pass
 
 def kind_sign(kind):
     return 1 if kind == '入账' else -1
 
-def pre_check_balance(person, project, diff):
-    cursor.execute("SELECT amount, kind from transfer WHERE person=? AND project=?", (person, project))
-    balance = decimal.Decimal(0)
-    for (amount, kind) in cursor.fetchall():
-        balance += kind_sign(kind) * decimal.Decimal(amount)
-    print('pre check balance', balance, diff, balance + diff)
-    if balance + diff < 0:
-        raise BalanceError(f'{person} 在 {project} 上的余额会变成 {balance + diff}')
+def get_balance(person, project):
+    cursor.execute("SELECT sub_project, amount, kind from transfer WHERE person=? AND project=?", (person, project))
+    sub_project_balance = defaultdict(decimal.Decimal)
+    for (sub_project, amount, kind) in cursor.fetchall():
+        sub_project_balance[sub_project] += kind_sign(kind) * decimal.Decimal(amount)
+    return sub_project_balance
 
-def post_check_balance(person, project):
-    cursor.execute("SELECT amount, kind from transfer WHERE person=? AND project=?", (person, project))
-    balance = decimal.Decimal(0)
-    for (amount, kind) in cursor.fetchall():
-        balance += kind_sign(kind) * decimal.Decimal(amount)
+def post_check_balance(person, project, sub_project):
+    balance = get_balance(person, project).get(sub_project, 0)
     print('post check balance', balance)
     if balance < 0:
-        raise BalanceError(f'{person} 在 {project} 上的余额会变成 {balance}')
+        raise BalanceError(f'{person} 在 {project} {sub_project} 上的余额会变成 {balance}')
 
-def add_transfer(time, person, project, kind, amount):
-    pre_check_balance(person, project, kind_sign(kind) * decimal.Decimal(amount))
-    cursor.execute(
-        "INSERT INTO transfer (time, person, project, kind, amount) VALUES (?, ?, ?, ?, ?)",
-        (time, person, project, kind, amount))
-    conn.commit()
+def add_transfer(time, person, project, sub_project, kind, amount, memo):
+    try:
+        cursor.execute('BEGIN')
+        cursor.execute(
+            "INSERT INTO transfer (time, person, project, sub_project, kind, amount, memo) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (time, person, project, sub_project, kind, amount, memo))
+        post_check_balance(person, project, sub_project)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 def delete_transfer(id_):
-    person, project, kind, amount = cursor.execute("SELECT person, project, kind, amount FROM transfer WHERE id = ?", (id_,)).fetchall()[0]
-    pre_check_balance(person, project, -kind_sign(kind) * decimal.Decimal(amount))
-    cursor.execute("DELETE FROM transfer WHERE id=?", (id_,))
-    conn.commit()
+    person, project, sub_project, kind, amount = cursor.execute("SELECT person, project, sub_project, kind, amount FROM transfer WHERE id = ?", (id_,)).fetchall()[0]
+    try:
+        cursor.execute('BEGIN')
+        cursor.execute("DELETE FROM transfer WHERE id=?", (id_,))
+        post_check_balance(person, project, sub_project)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
-def update_transfer(id_, time, person, project, kind, amount):
-    old_person, old_project = cursor.execute("SELECT person, project FROM transfer WHERE id = ?", (id_,)).fetchall()[0]
+def update_transfer(id_, time, person, project, sub_project, kind, amount, memo):
+    old_person, old_project, old_sub_project = cursor.execute("SELECT person, project, sub_project FROM transfer WHERE id = ?", (id_,)).fetchall()[0]
     try:
         cursor.execute('BEGIN')
         cursor.execute("""
             UPDATE transfer
-            SET time = ?, person = ?, project = ?, kind = ?, amount = ?
+            SET time = ?, person = ?, project = ?, sub_project = ?, kind = ?, amount = ?, memo = ?
             WHERE id = ?
-        """, (time, person, project, kind, amount, id_))
+        """, (time, person, project, sub_project, kind, amount, memo, id_))
         for p in [old_person, person]:
-            for j in [old_project, project]:
-                post_check_balance(p, j)
-            
+            for j, k in [(old_project, old_sub_project), (project, sub_project)]:
+                post_check_balance(p, j, k)
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
         conn.commit()
     except Exception:
         conn.rollback()
         raise
 
 def get_transfer():
-    stmt = "SELECT id, time, person, project, kind, amount from transfer ORDER BY time DESC"
+    stmt = "SELECT id, time, person, project, sub_project, kind, amount, memo from transfer ORDER BY time DESC"
     print('sql', stmt)
     cursor.execute(stmt)
     return cursor.fetchall()
 
 def filter_transfer(person, project, kind):
-    stmt = 'SELECT id, time, person, project, kind, amount FROM transfer WHERE 1 = 1'
+    stmt = 'SELECT id, time, person, project, sub_project, kind, amount, memo FROM transfer WHERE 1 = 1'
     if person:
         stmt += f' AND person = "{person}"'
     if project:
@@ -142,7 +190,6 @@ def filter_transfer(person, project, kind):
     cursor.execute(stmt)
     return cursor.fetchall()
 
-    
 
 def create_person_combo():
     combo = QComboBox()
@@ -163,8 +210,32 @@ def create_kind_combo(need_blank=False):
     combo.addItems(["入账", "出账"])
     return combo
 
-class EditDialog(QDialog):
-    def __init__(self, id_, time, person, project, kind, amount):
+
+def excel_from_table(table: QTableWidget, title, export_vertical_header):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = title
+
+    # Get the headers from the table and add them to the first row in the sheet
+    for col in range(table.columnCount()):
+        ws.cell(row=1, column=col+2, value=table.horizontalHeaderItem(col).text())
+
+    # Get the vertical headers (row headers) and add them to the first column
+    if export_vertical_header:
+        for row in range(table.rowCount()):
+            ws.cell(row=row+2, column=1, value=table.verticalHeaderItem(row).text())
+
+    # Get the table data and add it to the sheet starting from row 2
+    for row in range(table.rowCount()):
+        for col in range(table.columnCount()):
+            item = table.item(row, col)
+            if item:
+                ws.cell(row=row+2, column=col+2, value=item.text())
+
+    return wb
+
+class EditTranferDialog(QDialog):
+    def __init__(self, id_, time, person, project, sub_project, kind, amount, memo):
         super().__init__()
 
         self.id_ = id_
@@ -176,13 +247,24 @@ class EditDialog(QDialog):
         self.amount_edit.setValidator(QDoubleValidator(0.0, float('inf'), 2))
         self.person_combo = create_person_combo()
         self.project_combo = create_project_combo()
+        self.sub_project_combo = QComboBox()
         self.kind_combo = create_kind_combo()
+        self.memo_edit = QLineEdit()
+
+        self.load_sub_projects()
+        self.person_combo.setEditable(True) # allow deleted person
+        self.project_combo.setEditable(True) # allow deleted project
+        self.sub_project_combo.setEditable(True) # allow deleted sub project
 
         self.time_edit.setDateTime(QDateTime.fromString(time, "yyyy-MM-dd HH:mm:ss"))
         self.amount_edit.setText(str(amount))
         self.person_combo.setCurrentText(person)
         self.project_combo.setCurrentText(project)
+        self.sub_project_combo.setCurrentText(sub_project)
         self.kind_combo.setCurrentText(kind)
+        self.memo_edit.setText(memo)
+        
+        self.project_combo.currentTextChanged.connect(self.load_sub_projects)
 
         form_layout = QVBoxLayout()
         form_layout.addWidget(QLabel("时间:"))
@@ -191,10 +273,14 @@ class EditDialog(QDialog):
         form_layout.addWidget(self.person_combo)
         form_layout.addWidget(QLabel("项目:"))
         form_layout.addWidget(self.project_combo)
+        form_layout.addWidget(QLabel("子项目:"))
+        form_layout.addWidget(self.sub_project_combo)
         form_layout.addWidget(QLabel("类型:"))
         form_layout.addWidget(self.kind_combo)
         form_layout.addWidget(QLabel("金额:"))
         form_layout.addWidget(self.amount_edit)
+        form_layout.addWidget(QLabel("备注:"))
+        form_layout.addWidget(self.memo_edit)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         button_box.accepted.connect(self.handle_save)
@@ -205,14 +291,21 @@ class EditDialog(QDialog):
         layout.addWidget(button_box)
         self.setLayout(layout)
 
+    def load_sub_projects(self):
+        self.sub_project_combo.clear()
+        for name, _ in get_sub_project(self.project_combo.currentText()):
+            self.sub_project_combo.addItem(name)
+
     def handle_save(self):
         time = self.time_edit.dateTime().toString("yyyy-MM-dd HH:mm:ss")
         person = self.person_combo.currentText()
         project = self.project_combo.currentText()
+        sub_project = self.sub_project_combo.currentText()
         kind = self.kind_combo.currentText()
         amount = self.amount_edit.text()
+        memo = self.memo_edit.text()
         try:
-            update_transfer(self.id_, time, person, project, kind, amount)
+            update_transfer(self.id_, time, person, project, sub_project, kind, amount, memo)
         except BalanceError as e:
             QMessageBox.warning(self, "错误", str(e))
             return
@@ -257,6 +350,25 @@ class PersonTab(QWidget):
             add_person(name)
             self.load()
 
+class CreateSubProjectDialog(QDialog):
+    def __init__(self, parent_name):
+        super().__init__()
+        self.parent_name = parent_name
+        self.setWindowTitle("新建子项目")
+        self.name_input = QLineEdit()
+        self.save_btn = QPushButton("保存")
+        self.save_btn.clicked.connect(self.handle_save)
+        layout = QVBoxLayout()
+        layout.addWidget(self.name_input)
+        layout.addWidget(self.save_btn)
+        self.setLayout(layout)
+
+    def handle_save(self):
+        name = self.name_input.text()
+        if name:
+            add_sub_project(name, self.parent_name)
+            self.accept()
+
 class ProjectTab(QWidget):
     def __init__(self):
         super().__init__()
@@ -269,23 +381,60 @@ class ProjectTab(QWidget):
         add_btn.clicked.connect(self.handle_add)
         layout.addLayout(form)
         layout.addWidget(add_btn)
-        self.project_table = QTableWidget()
-        self.project_table.setColumnCount(2)
-        self.project_table.setHorizontalHeaderLabels(["项目名", "操作"])
-        self.project_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.project_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        layout.addWidget(self.project_table)
+        self.project_tree = QTreeWidget()
+        self.project_tree.setColumnCount(2)
+        self.project_tree.setHeaderLabels(["项目名", "操作"])
+        # self.project_tree.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        # self.project_tree.setEditTriggers(QTreeWidget.NoEditTriggers)
+        layout.addWidget(self.project_tree)
         self.setLayout(layout)
         self.load()
 
     def load(self):
-        rows = get_project()
-        self.project_table.setRowCount(len(rows))
-        for row, name in enumerate(rows):
-            self.project_table.setItem(row, 0, QTableWidgetItem(name))
+        self.project_tree.clear()
+        top_items = {}
+        for name in get_project():
+            item = QTreeWidgetItem([name, ''])
+            self.project_tree.addTopLevelItem(item)
+            create_btn = QPushButton("创建子项目")
+            create_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            create_btn.clicked.connect(partial(self.handle_create_sub_project, name))
+            delete_btn = QPushButton("删除")
+            delete_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            delete_btn.clicked.connect(partial(self.handle_delete_project, name))
+            action_widget = QWidget()
+            action_layout = QHBoxLayout()
+            action_layout.addWidget(delete_btn)
+            action_layout.addWidget(create_btn)
+            action_layout.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
+            # action_layout.setStretch(0, 0)
+            # action_layout.setStretch(1, 0)
+            action_layout.setAlignment(delete_btn, Qt.AlignLeft)
+            action_layout.setAlignment(create_btn, Qt.AlignLeft)
+            action_widget.setLayout(action_layout)
+            self.project_tree.setItemWidget(item, 1, action_widget)
+            top_items[name] = item
+
+        for name, parent in get_sub_project():
+            item = QTreeWidgetItem([name, ''])
+            top_items[parent].addChild(item)
             btn = QPushButton("删除")
-            btn.clicked.connect(partial(self.handle_delete, name))
-            self.project_table.setCellWidget(row, 1, btn)
+            btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            btn.clicked.connect(partial(self.handle_delete_sub_project, name))
+            action_widget = QWidget()
+            action_layout = QHBoxLayout()
+            action_layout.addWidget(btn)
+            # action_layout.setStretch(0, 0)
+            action_layout.setAlignment(btn, Qt.AlignLeft)
+            action_widget.setLayout(action_layout)
+            self.project_tree.setItemWidget(item, 1, action_widget)
+
+        self.project_tree.expandAll()
+
+    def handle_create_sub_project(self, parent):
+        dialog = CreateSubProjectDialog(parent)
+        dialog.exec()
+        self.load()
 
     def handle_add(self):
         name = self.project_name_input.text()
@@ -293,8 +442,19 @@ class ProjectTab(QWidget):
             add_project(name)
             self.load()
 
-    def handle_delete(self, name):
+    def handle_add_sub(self):
+        name = self.project_name_input.text()
+        if name:
+            add_project(name)
+            self.load()
+
+    def handle_delete_project(self, name):
         delete_project(name)
+        self.load()
+
+
+    def handle_delete_sub_project(self, name):
+        delete_sub_project(name)
         self.load()
 
 class TransferTab(QWidget):
@@ -307,31 +467,30 @@ class TransferTab(QWidget):
         self.time_input.setCalendarPopup(True)
         self.person_input = QComboBox()
         self.project_input = QComboBox()
+        self.project_balance = QLabel()
+        self.sub_project_input = QComboBox()
         self.kind_input = create_kind_combo()
         self.amount_input = QLineEdit()
         self.amount_input.setValidator(QDoubleValidator(0.0, float('inf'), 2))
+        self.memo_input = QLineEdit()
+
+        self.person_input.setEditable(True)
+
+        self.project_input.currentTextChanged.connect(self.load_sub_projects)
+        self.project_input.currentTextChanged.connect(self.load_balance)
+        self.person_input.currentTextChanged.connect(self.load_balance)
 
         form.addRow("时间:", self.time_input)
         form.addRow("人员:", self.person_input)
         form.addRow("项目:", self.project_input)
+        form.addRow("余额:", self.project_balance)
+        form.addRow("子项目:", self.sub_project_input)
         form.addRow("类型:", self.kind_input)
         form.addRow("金额:", self.amount_input)
+        form.addRow("备注:", self.memo_input)
 
         add_btn = QPushButton("添加转账")
-
-        def handle_add():
-            time = self.time_input.dateTime().toString("yyyy-MM-dd HH:mm:ss")
-            person = self.person_input.currentText()
-            project = self.project_input.currentText()
-            kind = self.kind_input.currentText()
-            amount = self.amount_input.text()
-            try:
-                add_transfer(time, person, project, kind, amount)
-            except BalanceError as e:
-                QMessageBox.warning(self, "错误", str(e))
-                return
-            self.load()
-        add_btn.clicked.connect(handle_add)
+        add_btn.clicked.connect(self.handle_add)
 
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
@@ -343,6 +502,9 @@ class TransferTab(QWidget):
         self.kind_filter = create_kind_combo(True)
 
         filter_btn = QPushButton("过滤")
+
+        export_btn = QPushButton('导出为 excel')
+        export_btn.clicked.connect(self.export_to_excel)
 
         self.filters = ("", "", "")
         self.filters_label = QLabel()
@@ -364,15 +526,29 @@ class TransferTab(QWidget):
         layout.addWidget(line)
         layout.addLayout(filter_bar)
         layout.addWidget(self.filters_label)
+        layout.addWidget(export_btn)
 
         self.transfer_table = QTableWidget()
-        self.transfer_table.setColumnCount(6)
-        self.transfer_table.setHorizontalHeaderLabels(["时间", "人员", "项目", "类型", "金额", "操作"])
-        self.transfer_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        headers = ["时间", "人员", "项目", "子项目", "类型", "金额", "备注", "操作"]
+        self.transfer_table.setColumnCount(len(headers))
+        self.transfer_table.setHorizontalHeaderLabels(headers)
     
         layout.addWidget(self.transfer_table)
         self.setLayout(layout)
         self.load()
+
+    def load_balance(self):
+        sub_project_balance = get_balance(self.person_input.currentText(), self.project_input.currentText())
+        self.project_balance.clear()
+        content = [f'合计: {sum(sub_project_balance.values())}']
+        for sub_project, balance in sub_project_balance.items():
+            content.append(f'{sub_project}: {balance}')
+        self.project_balance.setText(', '.join(content))
+
+    def load_sub_projects(self):
+        self.sub_project_input.clear()
+        for name, _ in get_sub_project(self.project_input.currentText()):
+            self.sub_project_input.addItem(name)
 
     def load_combo(self):
         self.person_input.clear()
@@ -382,15 +558,15 @@ class TransferTab(QWidget):
         for name in get_project():
             self.project_input.addItem(name)
 
-    def load(self):
-        self.load_combo()
-
+    def load_list(self):
         TIME_CELL = 0
         PERSON_CELL = 1
         PROJECT_CELL = 2
-        KIND_CELL = 3
-        AMOUNT_CELL = 4
-        ACTION_CELL = 5
+        SUB_PROJECT_CELL = 3
+        KIND_CELL = 4
+        AMOUNT_CELL = 5
+        MEMO_CELL = 6
+        ACTION_CELL = 7
 
         rows = filter_transfer(*self.filters)
 
@@ -401,17 +577,16 @@ class TransferTab(QWidget):
 
         self.transfer_table.setRowCount(len(rows))
 
-        for row, (id_, time, person, project, kind, amount) in enumerate(rows):
+        for row, (id_, time, person, project, sub_project, kind, amount, memo) in enumerate(rows):
             action_cell_widget = QWidget()
-            layout = QHBoxLayout(action_cell_widget)
 
+            layout = QHBoxLayout(action_cell_widget)
             edit_btn = QPushButton('编辑')
             delete_btn = QPushButton("删除")
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(2)
 
-            for btn in [edit_btn, delete_btn]:
-                btn.setFixedHeight(20)
-
-            edit_btn.clicked.connect(partial(self.handle_edit, id_, time, person, project, kind, amount))
+            edit_btn.clicked.connect(partial(self.handle_edit, id_, time, person, project, sub_project, kind, amount, memo))
             delete_btn.clicked.connect(partial(self.handle_delete, id_))
 
             layout.addWidget(edit_btn)
@@ -420,16 +595,40 @@ class TransferTab(QWidget):
             self.transfer_table.setItem(row, TIME_CELL, QTableWidgetItem(time))
             self.transfer_table.setItem(row, PERSON_CELL, QTableWidgetItem(person or ""))
             self.transfer_table.setItem(row, PROJECT_CELL, QTableWidgetItem(project or ""))
+            self.transfer_table.setItem(row, SUB_PROJECT_CELL, QTableWidgetItem(sub_project or ""))
             self.transfer_table.setItem(row, KIND_CELL, QTableWidgetItem(kind or ""))
             self.transfer_table.setItem(row, AMOUNT_CELL, QTableWidgetItem(str(amount)))
+            self.transfer_table.setItem(row, MEMO_CELL, QTableWidgetItem(memo or ""))
             self.transfer_table.setCellWidget(row, ACTION_CELL, action_cell_widget)
 
             self.transfer_table.setEditTriggers(QTableWidget.NoEditTriggers)
 
-    def handle_edit(self, id_, time, person, project, kind, amount):
-        dialog = EditDialog(id_, time, person, project, kind, amount)
+    def load(self):
+        self.load_combo()
+        self.load_list()
+
+
+    def handle_add(self):
+        time = self.time_input.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        person = self.person_input.currentText()
+        project = self.project_input.currentText()
+        sub_project = self.sub_project_input.currentText()
+        kind = self.kind_input.currentText()
+        amount = self.amount_input.text()
+        memo = self.memo_input.text()
+        try:
+            add_transfer(time, person, project, sub_project, kind, amount, memo)
+        except BalanceError as e:
+            QMessageBox.warning(self, "错误", str(e))
+            return
+        self.load_balance()
+        self.load_list()
+
+    def handle_edit(self, id_, time, person, project, sub_project, kind, amount, memo):
+        dialog = EditTranferDialog(id_, time, person, project, sub_project, kind, amount, memo)
         if dialog.exec() == QDialog.Accepted:
-            self.load()
+            self.load_balance()
+            self.load_list()
 
     def handle_delete(self, id_):
         try:
@@ -437,28 +636,68 @@ class TransferTab(QWidget):
         except BalanceError as e:
             QMessageBox.warning(self, "错误", str(e))
             return
-        self.load()
+        self.load_balance()
+        self.load_list()
+
+    def export_to_excel(self):
+        options = QFileDialog.Options()
+        file_name, _ = QFileDialog.getSaveFileName(self, "导出为 Excel 文件", "", "Excel Files (*.xlsx);;All Files (*)", options=options)
+
+        if not file_name:
+            print('file name not specified')
+            return
+
+        wb = excel_from_table(self.transfer_table, "流水记录", False)
+        msg_content = "导出成功，文件已保存到 {}".format(file_name)
+        try:
+            # Save the workbook to a file
+            wb.save(file_name)
+        except Exception as e:
+            msg_content = "导出失败，错误信息：{}".format(str(e))
+
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Information)
+        msg.setText(msg_content)
+        msg.setWindowTitle("导出结果")
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.exec()
 
 class SummaryTab(QWidget):
     def __init__(self):
         super().__init__()
         layout = QVBoxLayout()
+        self.btn = QPushButton("导出为 Excel")
+        self.btn.clicked.connect(self.export_to_excel)
         self.summary_table = QTableWidget()
         self.summary_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.summary_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.btn)
         layout.addWidget(self.summary_table)
         self.setLayout(layout)
 
     def load(self):
         transfer_list = get_transfer()
+
         person_summary = defaultdict(lambda: defaultdict(decimal.Decimal))
+        for person in get_person():
+            person_summary[person]['入'] = 0
+            person_summary[person]['出'] = 0
+
         project_summary = defaultdict(decimal.Decimal)
+        for sub_project, project in get_sub_project():
+            project_summary[f'{project}\n{sub_project}'] = 0
+
         summary = defaultdict(decimal.Decimal)
-        for row, (id_, time, person, project, kind, amount) in enumerate(transfer_list):
+        for person in get_person():
+            for sub_project, project in get_sub_project():
+                summary[(person, '入', f'{project}\n{sub_project}')] = 0
+                summary[(person, '出', f'{project}\n{sub_project}')] = 0
+
+        for row, (id_, time, person, project, sub_project, kind, amount, memo) in enumerate(transfer_list):
             amount = decimal.Decimal(amount)
-            summary[(person, kind, project)] += amount
+            summary[(person, kind, f'{project}\n{sub_project}')] += amount
             person_summary[person][kind] += amount
-            project_summary[project] += kind_sign(kind) * amount
+            project_summary[f'{project}\n{sub_project}'] += kind_sign(kind) * amount
 
         self.summary_table.clear()
         self.summary_table.clearSpans()
@@ -503,10 +742,112 @@ class SummaryTab(QWidget):
         self.summary_table.setSpan(len(vertial_headers) - 1, len(project_summary), 1, 2)
         print('set span', len(vertial_headers) - 1, len(project_summary), 1, 2)
 
+    def export_to_excel(self):
+        options = QFileDialog.Options()
+        file_name, _ = QFileDialog.getSaveFileName(self, "导出为 Excel 文件", "", "Excel Files (*.xlsx);;All Files (*)", options=options)
+
+        if not file_name:
+            print('file name not specified')
+            return
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "流水统计"
+
+        # Get the headers from the table and add them to the first and second row in the sheet
+        for col in range(self.summary_table.columnCount()):
+            header_lines = self.summary_table.horizontalHeaderItem(col).text().split('\n')
+            ws.cell(row=1, column=col+3, value=header_lines[0])
+            if len(header_lines) > 1:
+                ws.cell(row=2, column=col+3, value=header_lines[1])
+
+        # merge adjacent cells with identical value at first row
+        project_start_col = 3
+        for col in range(4, self.summary_table.columnCount() + 3):
+            if ws.cell(row=1, column=col).value != ws.cell(row=1, column=col-1).value:
+                ws.merge_cells(start_row=1, start_column=project_start_col, end_row=1, end_column=col - 1)
+                ws.cell(row=1, column=project_start_col).alignment = openpyxl.styles.Alignment(horizontal='center', vertical='center')
+                project_start_col = col
+
+        # Get the vertical headers (row headers) and add them to the first and second column
+        for row in range(self.summary_table.rowCount()):
+            header_sections = self.summary_table.verticalHeaderItem(row).text().split(' ', 1)
+            if len(header_sections) == 2:
+                ws.cell(row=row+3, column=1, value=header_sections[0])
+                ws.cell(row=row+3, column=2, value=header_sections[1])
+            else:
+                ws.cell(row=row+3, column=2, value=header_sections[0])
+
+        # merge adjacent cells that belong to same person
+        for row in range(3, self.summary_table.rowCount() + 2, 2):
+            ws.merge_cells(start_row=row, start_column=1, end_row=row+1, end_column=1)
+            ws.cell(row=row, column=1).alignment = openpyxl.styles.Alignment(horizontal='center', vertical='center')
+            ws.merge_cells(start_row=row, start_column=self.summary_table.columnCount() + 2, end_row=row+1, end_column=self.summary_table.columnCount() + 2)
+            ws.cell(row=row, column=self.summary_table.columnCount() + 2).alignment = openpyxl.styles.Alignment(horizontal='center', vertical='center')
+
+        # Get the table data and add it to the sheet starting from row 2
+        for row in range(self.summary_table.rowCount()):
+            for col in range(self.summary_table.columnCount()):
+                item = self.summary_table.item(row, col)
+                if item:
+                    ws.cell(row=row+3, column=col+3, value= decimal.Decimal(item.text()))
+                    ws.cell(row=row+3, column=col+3).alignment = openpyxl.styles.Alignment(horizontal='center', vertical='center')
+
+        # merge blank cells at topleft
+        ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=2)
+
+        # merge '项目合计'
+        ws.cell(row=self.summary_table.rowCount() + 2, column=1, value='项目合计')
+        ws.merge_cells(start_row=self.summary_table.rowCount() + 2, start_column=1, end_row=self.summary_table.rowCount() + 2, end_column=2)
+        ws.cell(row=self.summary_table.rowCount() + 2, column=1).alignment = openpyxl.styles.Alignment(horizontal='center', vertical='center')
+
+        # merge bottomright 2 cells
+        ws.merge_cells(start_row=self.summary_table.rowCount() + 2, start_column=self.summary_table.columnCount() + 1, end_row=self.summary_table.rowCount() + 2, end_column=self.summary_table.columnCount() + 2)
+        ws.cell(row=self.summary_table.rowCount() + 2, column=self.summary_table.columnCount() + 1).alignment = openpyxl.styles.Alignment(horizontal='center', vertical='center')
+
+        msg_content = "导出成功，文件已保存到 {}".format(file_name)
+        try:
+            # Save the workbook to a file
+            wb.save(file_name)
+        except Exception as e:
+            msg_content = "导出失败，错误信息：{}".format(str(e))
+
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Information)
+        msg.setText(msg_content)
+        msg.setWindowTitle("导出结果")
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.exec()
+
+class SettingTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        form = QFormLayout()
+        font_combo = QComboBox()
+        font_combo.addItems(['小', '中', '大'])
+        font_combo.currentTextChanged.connect(self.change_font)
+        form.addRow("字体大小:", font_combo)
+        self.setLayout(form)
+
+
+    def change_font(self, size):
+        font = QFont()
+        if size == "小":
+            font.setPointSize(10)
+        elif size == "中":
+            font.setPointSize(14)
+        elif size == "大":
+            font.setPointSize(18)
+        QApplication.setFont(font)
+
+    def load(self):
+        pass
+
+
 class LedgerApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setFixedSize(1000, 800)
+        self.setMinimumSize(1000, 800)
         self.setWindowTitle("账本应用")
 
         layout = QVBoxLayout()
@@ -516,6 +857,7 @@ class LedgerApp(QWidget):
         self.tabs.addTab(ProjectTab(), "项目")
         self.tabs.addTab(TransferTab(), "流水")
         self.tabs.addTab(SummaryTab(), "统计")
+        self.tabs.addTab(SettingTab(), "设置")
 
         self.tabs.currentChanged.connect(self.on_tab_changed)
 
@@ -527,7 +869,11 @@ class LedgerApp(QWidget):
         self.tabs.widget(index).load()
 
 if __name__ == "__main__":
-    init_db()
+    if len(sys.argv) > 1 and sys.argv[1] == "--drop":
+        init_db(True)
+    else:
+        init_db(False)
+
     app = QApplication(sys.argv)
     window = LedgerApp()
     window.show()
