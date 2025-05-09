@@ -1,5 +1,6 @@
 import sys
 import sqlite3
+from typing import override
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QTabWidget,
     QTableWidget, QTableWidgetItem, QHBoxLayout, QLineEdit, QFormLayout,
@@ -7,7 +8,7 @@ from PySide6.QtWidgets import (
     QHeaderView, QFrame, QTreeWidget, QTreeWidgetItem, QSizePolicy, QSpacerItem,
     QFileDialog
 )
-from PySide6.QtGui import QDoubleValidator, QFont
+from PySide6.QtGui import QDoubleValidator, QFont, QDropEvent, QDragMoveEvent, QDragEnterEvent, QDragLeaveEvent, QDrag
 from PySide6.QtCore import Qt
 from PySide6.QtCore import QDateTime
 from collections import defaultdict
@@ -30,66 +31,136 @@ def init_db(drop):
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS person (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             UNIQUE(name)
         )
     """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS project (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
+            rank INTEGER NOT NULL,
             UNIQUE(name)
         )
     """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sub_project (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
-            parent TEXT NOT NULL,
+            parent INTEGER NOT NULL,
+            rank INTEGER NOT NULL,
             UNIQUE(name, parent),
-            FOREIGN KEY (parent) REFERENCES project(name) ON DELETE CASCADE
+            FOREIGN KEY (parent) REFERENCES project(id) ON DELETE RESTRICT
         )
     """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS transfer (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             time TEXT NOT NULL,
-            person TEXT,
-            project TEXT,
-            sub_project TEXT,
-            kind TEXT,
-            amount TEXT,
-            memo TEXT
+            person INTEGER NOT NULL,
+            sub_project INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            amount TEXT NOT NULL,
+            memo TEXT,
+            FOREIGN KEY (person) REFERENCES person(id) ON DELETE RESTRICT,
+            FOREIGN KEY (sub_project) REFERENCES sub_project(id) ON DELETE RESTRICT
         )
     """)
     conn.commit()
 
 def get_person():
-    cursor.execute("SELECT name FROM person")
-    return [item[0] for item in cursor.fetchall()]
+    cursor.execute("SELECT id, name FROM person")
+    return cursor.fetchall()
+
+def get_person_name(id):
+    cursor.execute("SELECT name FROM person WHERE id = ?", (id,))
+    return cursor.fetchone()[0]
 
 def get_project():
-    cursor.execute("SELECT name FROM project")
-    return [item[0] for item in cursor.fetchall()]
+    cursor.execute("SELECT id, name FROM project ORDER BY rank")
+    return cursor.fetchall()
+
+def swap_project_order(name1, name2):
+    cursor.execute("SELECT rank FROM project WHERE name = ?", (name1,))
+    rank1 = cursor.fetchone()[0]
+    cursor.execute("SELECT rank FROM project WHERE name = ?", (name2,))
+    rank2 = cursor.fetchone()[0]
+
+    cursor.execute("BEGIN")
+    cursor.execute("UPDATE project SET rank = ? WHERE name = ?", (rank2, name1))
+    cursor.execute("UPDATE project SET rank = ? WHERE name = ?", (rank1, name2))
+    conn.commit()
 
 def get_sub_project(parent=None):
-    if parent:
-        cursor.execute("SELECT name, parent FROM sub_project WHERE parent = ?", (parent,))
+    if parent != None:
+        print(parent)
+        cursor.execute("SELECT id FROM project WHERE name = ?", (parent,))
+        item = cursor.fetchone()
+        if item is None:
+            return []
+        parent_id = item[0]
+        cursor.execute("""
+            SELECT sub_project.name AS name, project.name AS parent
+            FROM sub_project LEFT JOIN project ON sub_project.parent = project.id
+            WHERE parent = ?
+            ORDER BY project.rank ASC, sub_project.rank ASC
+        """, (parent_id,))
     else:
-        cursor.execute("SELECT name, parent FROM sub_project")
+        cursor.execute("""
+            SELECT sub_project.name AS name, project.name AS parent
+            FROM sub_project LEFT JOIN project ON sub_project.parent = project.id
+            ORDER BY project.rank ASC, sub_project.rank ASC
+        """)
     return cursor.fetchall()
+
+
+def swap_sub_project_order(parent, name1, name2):
+    cursor.execute("SELECT rank FROM sub_project WHERE name = ? AND parent = ?", (name1, parent))
+    rank1 = cursor.fetchone()[0]
+    cursor.execute("SELECT rank FROM sub_project WHERE name = ? AND parent = ?", (name2, parent))
+    rank2 = cursor.fetchone()[0]
+
+    cursor.execute("BEGIN")
+    cursor.execute("UPDATE sub_project SET rank = ? WHERE name = ? AND parent = ?", (rank2, name1, parent))
+    cursor.execute("UPDATE sub_project SET rank = ? WHERE name = ? AND parent = ?", (rank1, name2, parent))
+    conn.commit()
 
 def add_person(name):
     if name:
         cursor.execute("INSERT INTO person (name) VALUES (?)", (name,))
         conn.commit()
 
+def update_person(person_id, name):
+    if name:
+        cursor.execute("UPDATE person SET name = ? WHERE id = ?", (name, person_id))
+        conn.commit()
+
 def add_project(name):
     if name:
-        cursor.execute("INSERT INTO project (name) VALUES (?)", (name,))
+        cursor.execute("SELECT MAX(rank) FROM project")
+        item = cursor.fetchone()[0]
+        print(item)
+        max_rank = item if item else 0
+        cursor.execute("INSERT INTO project (name, rank) VALUES (?, ?)", (name, max_rank + 1))
+        conn.commit()
+
+def update_project(name, new_name):
+    if new_name:
+        cursor.execute("UPDATE project SET name = ? WHERE name = ?", (new_name, name))
         conn.commit()
 
 def add_sub_project(name, parent):
     if name:
-        cursor.execute("INSERT INTO sub_project (name, parent) VALUES (?, ?)", (name, parent))
+        cursor.execute("SELECT MAX(rank) FROM sub_project WHERE parent = ?", (parent,))
+        item = cursor.fetchone()[0]
+        max_rank = item if item else 0
+        cursor.execute("INSERT INTO sub_project (name, parent, rank) VALUES (?, ?, ?)", (name, parent, max_rank + 1))
+        conn.commit()
+
+def update_sub_project(parent, name, new_name):
+    if new_name:
+        cursor.execute("UPDATE sub_project SET name = ? WHERE parent = ? AND name = ?", (new_name, parent, name))
         conn.commit()
 
 def delete_person(person):
@@ -101,10 +172,12 @@ def delete_project(project):
     conn.commit()
 
 
-def delete_sub_project(project):
-    cursor.execute("DELETE FROM sub_project WHERE name=?", (project,))
+def delete_sub_project(project, sub_project):
+    cursor.execute("DELETE FROM sub_project WHERE parent=? AND name=?", (project, sub_project))
     conn.commit()
 
+class InvalidInputError(Exception):
+    pass
 
 class BalanceError(Exception):
     pass
@@ -113,7 +186,14 @@ def kind_sign(kind):
     return 1 if kind == '入账' else -1
 
 def get_balance(person, project):
-    cursor.execute("SELECT sub_project, amount, kind from transfer WHERE person=? AND project=?", (person, project))
+    cursor.execute("""
+        SELECT sub_project.name, transfer.amount, transfer.kind
+        FROM transfer
+        LEFT JOIN person ON transfer.person = person.id
+        LEFT JOIN sub_project ON transfer.sub_project = sub_project.id
+        LEFT JOIN project ON sub_project.parent = project.id
+        WHERE person.name=? AND project.name=?
+    """, (person, project))
     sub_project_balance = defaultdict(decimal.Decimal)
     for (sub_project, amount, kind) in cursor.fetchall():
         sub_project_balance[sub_project] += kind_sign(kind) * decimal.Decimal(amount)
@@ -125,12 +205,34 @@ def post_check_balance(person, project, sub_project):
     if balance < 0:
         raise BalanceError(f'{person} 在 {project} {sub_project} 上的余额会变成 {balance}')
 
+def person_name_to_id(name):
+    item = cursor.execute("SELECT id FROM person WHERE name=?", (name,)).fetchone()
+    if item is None:
+        raise InvalidInputError(f'人员 {name} 不存在')
+    return item[0]
+
+def project_name_to_id(parent_name, name):
+    item = cursor.execute("SELECT id FROM project WHERE name=?", (parent_name,)).fetchone()
+    if item is None:
+        raise InvalidInputError(f'项目 {parent_name} 不存在')
+    project_id = item[0]
+
+    item = cursor.execute("SELECT id FROM sub_project WHERE name=? AND parent=?", (name, project_id)).fetchone()
+    if item is None:
+        raise InvalidInputError(f'子项目 {name} 不存在')
+    sub_project_id = item[0]
+
+    return sub_project_id
+
 def add_transfer(time, person, project, sub_project, kind, amount, memo):
+    person_id = person_name_to_id(person)
+    sub_project_id = project_name_to_id(project, sub_project)
+
     try:
         cursor.execute('BEGIN')
         cursor.execute(
-            "INSERT INTO transfer (time, person, project, sub_project, kind, amount, memo) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (time, person, project, sub_project, kind, amount, memo))
+            "INSERT INTO transfer (time, person, sub_project, kind, amount, memo) VALUES (?, ?, ?, ?, ?, ?)",
+            (time, person_id, sub_project_id, kind, amount, memo))
         post_check_balance(person, project, sub_project)
         conn.commit()
     except Exception:
@@ -138,7 +240,15 @@ def add_transfer(time, person, project, sub_project, kind, amount, memo):
         raise
 
 def delete_transfer(id_):
-    person, project, sub_project, kind, amount = cursor.execute("SELECT person, project, sub_project, kind, amount FROM transfer WHERE id = ?", (id_,)).fetchall()[0]
+    person, project, sub_project = cursor.execute("""
+        SELECT person.name, project.name, sub_project.name
+        FROM transfer
+        LEFT JOIN person ON transfer.person = person.id
+        LEFT JOIN sub_project ON transfer.sub_project = sub_project.id
+        LEFT JOIN project ON sub_project.parent = project.id
+        WHERE id = ?
+    """, (id_,)).fetchall()[0]
+
     try:
         cursor.execute('BEGIN')
         cursor.execute("DELETE FROM transfer WHERE id=?", (id_,))
@@ -149,14 +259,25 @@ def delete_transfer(id_):
         raise
 
 def update_transfer(id_, time, person, project, sub_project, kind, amount, memo):
-    old_person, old_project, old_sub_project = cursor.execute("SELECT person, project, sub_project FROM transfer WHERE id = ?", (id_,)).fetchall()[0]
+    person_id = person_name_to_id(person)
+    sub_project_id = project_name_to_id(project, sub_project)
+
+    old_person, old_project, old_sub_project = cursor.execute("""
+        SELECT person.name, project.name, sub_project.name
+        FROM transfer
+        LEFT JOIN person ON transfer.person = person.id
+        LEFT JOIN sub_project ON transfer.sub_project = sub_project.id
+        LEFT JOIN project ON sub_project.parent = project.id
+        WHERE id = ?
+    """, (id_,)).fetchall()[0]
+
     try:
         cursor.execute('BEGIN')
         cursor.execute("""
             UPDATE transfer
-            SET time = ?, person = ?, project = ?, sub_project = ?, kind = ?, amount = ?, memo = ?
+            SET time = ?, person = ?, sub_project = ?, kind = ?, amount = ?, memo = ?
             WHERE id = ?
-        """, (time, person, project, sub_project, kind, amount, memo, id_))
+        """, (time, person_id, sub_project_id, kind, amount, memo, id_))
         for p in [old_person, person]:
             for j, k in [(old_project, old_sub_project), (project, sub_project)]:
                 post_check_balance(p, j, k)
@@ -166,19 +287,28 @@ def update_transfer(id_, time, person, project, sub_project, kind, amount, memo)
         conn.rollback()
         raise
 
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-
 def get_transfer():
-    stmt = "SELECT id, time, person, project, sub_project, kind, amount, memo from transfer ORDER BY time DESC"
+    stmt = """
+        SELECT transfer.id, transfer.time, person.name, project.name, sub_project.name, transfer.kind, transfer.amount, transfer.memo
+        FROM transfer
+        LEFT JOIN person ON transfer.person = person.id
+        LEFT JOIN sub_project ON transfer.sub_project = sub_project.id
+        LEFT JOIN project ON sub_project.parent = project.id
+        ORDER BY time DESC
+    """
     print('sql', stmt)
     cursor.execute(stmt)
     return cursor.fetchall()
 
 def filter_transfer(person, project, kind):
-    stmt = 'SELECT id, time, person, project, sub_project, kind, amount, memo FROM transfer WHERE 1 = 1'
+    stmt = '''
+        SELECT transfer.id, transfer.time, person.name, project.name, sub_project.name, transfer.kind, transfer.amount, transfer.memo
+        FROM transfer
+        LEFT JOIN person ON transfer.person = person.id
+        LEFT JOIN sub_project ON transfer.sub_project = sub_project.id
+        LEFT JOIN project ON sub_project.parent = project.id
+        WHERE 1 = 1
+    '''
     if person:
         stmt += f' AND person = "{person}"'
     if project:
@@ -193,13 +323,13 @@ def filter_transfer(person, project, kind):
 
 def create_person_combo():
     combo = QComboBox()
-    for name in get_person():
+    for _, name in get_person():
         combo.addItem(name)
     return combo
 
 def create_project_combo():
     combo = QComboBox()
-    for name in get_project():
+    for _, name in get_project():
         combo.addItem(name)
     return combo
 
@@ -306,10 +436,30 @@ class EditTranferDialog(QDialog):
         memo = self.memo_edit.text()
         try:
             update_transfer(self.id_, time, person, project, sub_project, kind, amount, memo)
-        except BalanceError as e:
+        except Exception as e:
             QMessageBox.warning(self, "错误", str(e))
             return
         self.accept()
+
+class EditPersonDialog(QDialog):
+    def __init__(self, person_id):
+        super().__init__()
+        self.person_id = person_id
+        self.setWindowTitle("编辑姓名")
+        self.name_input = QLineEdit()
+        self.name_input.setText(get_person_name(person_id))
+        self.save_btn = QPushButton("保存")
+        self.save_btn.clicked.connect(self.handle_save)
+        layout = QVBoxLayout()
+        layout.addWidget(self.name_input)
+        layout.addWidget(self.save_btn)
+        self.setLayout(layout)
+
+    def handle_save(self):
+        name = self.name_input.text()
+        if name:
+            update_person(self.person_id, name)
+            self.accept()
 
 class PersonTab(QWidget):
     def __init__(self):
@@ -334,15 +484,43 @@ class PersonTab(QWidget):
     def load(self):
         rows = get_person()
         self.person_table.setRowCount(len(rows))
-        for row, name in enumerate(rows):
+        for row, (id_, name) in enumerate(rows):
             self.person_table.setItem(row, 0, QTableWidgetItem(name))
-            btn = QPushButton("删除")
-            btn.clicked.connect(partial(self.handle_delete, name))
-            self.person_table.setCellWidget(row, 1, btn)
+
+            delete_btn = QPushButton("删除")
+            delete_btn.clicked.connect(partial(self.handle_delete, name))
+
+            edit_btn = QPushButton("编辑")
+            edit_btn.clicked.connect(partial(self.handle_edit, id_))
+
+            action_layout = QHBoxLayout()
+            action_layout.setContentsMargins(0, 0, 0, 0)
+            action_layout.setSpacing(2)
+
+            action_widget = QWidget()
+            action_widget.setLayout(action_layout)
+            action_layout.addWidget(edit_btn)
+            action_layout.addWidget(delete_btn)
+
+            self.person_table.setCellWidget(row, 1, action_widget)
 
     def handle_delete(self, name):
-        delete_person(name)
-        self.load()
+        reply = QMessageBox.question(self, "确认", f"确定要删除 {name} 吗？", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.No:
+            return
+
+        try:
+            delete_person(name)
+            self.load()
+        except sqlite3.IntegrityError:
+            QMessageBox.warning(self, "错误", "存在相关交易记录，无法删除")
+        except Exception as e:
+            QMessageBox.warning(self, "错误", str(e))
+
+    def handle_edit(self, person_id):
+        dialog = EditPersonDialog(person_id)
+        if dialog.exec():
+            self.load()
 
     def handle_add(self):
         name = self.person_name_input.text()
@@ -351,9 +529,9 @@ class PersonTab(QWidget):
             self.load()
 
 class CreateSubProjectDialog(QDialog):
-    def __init__(self, parent_name):
+    def __init__(self, parent_id):
         super().__init__()
-        self.parent_name = parent_name
+        self.parent_id = parent_id
         self.setWindowTitle("新建子项目")
         self.name_input = QLineEdit()
         self.save_btn = QPushButton("保存")
@@ -366,7 +544,47 @@ class CreateSubProjectDialog(QDialog):
     def handle_save(self):
         name = self.name_input.text()
         if name:
-            add_sub_project(name, self.parent_name)
+            add_sub_project(name, self.parent_id)
+            self.accept()
+
+
+class EditProjectDialog(QDialog):
+    def __init__(self, name):
+        super().__init__()
+        self.name = name
+        self.setWindowTitle("编辑项目")
+        self.name_input = QLineEdit(self.name)
+        self.save_btn = QPushButton("保存")
+        self.save_btn.clicked.connect(self.handle_save)
+        layout = QVBoxLayout()
+        layout.addWidget(self.name_input)
+        layout.addWidget(self.save_btn)
+        self.setLayout(layout)
+
+    def handle_save(self):
+        name = self.name_input.text()
+        if name:
+            update_project(self.name, name)
+            self.accept()
+
+class EditSubProjectDialog(QDialog):
+    def __init__(self, parent_id, name):
+        super().__init__()
+        self.parent_id = parent_id
+        self.name = name
+        self.setWindowTitle("编辑子项目")
+        self.name_input = QLineEdit(self.name)
+        self.save_btn = QPushButton("保存")
+        self.save_btn.clicked.connect(self.handle_save)
+        layout = QVBoxLayout()
+        layout.addWidget(self.name_input)
+        layout.addWidget(self.save_btn)
+        self.setLayout(layout)
+
+    def handle_save(self):
+        name = self.name_input.text()
+        if name:
+            update_sub_project(self.parent_id, self.name, name)
             self.accept()
 
 class ProjectTab(QWidget):
@@ -384,52 +602,122 @@ class ProjectTab(QWidget):
         self.project_tree = QTreeWidget()
         self.project_tree.setColumnCount(2)
         self.project_tree.setHeaderLabels(["项目名", "操作"])
-        # self.project_tree.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        # self.project_tree.setEditTriggers(QTreeWidget.NoEditTriggers)
+
         layout.addWidget(self.project_tree)
         self.setLayout(layout)
         self.load()
 
     def load(self):
         self.project_tree.clear()
+
+        project_list = []
+        project_id_map = {}
+        for id, name in get_project():
+            project_list.append(name)
+            project_id_map[name] = id
+
         top_items = {}
-        for name in get_project():
+        for i, name in enumerate(project_list):
             item = QTreeWidgetItem([name, ''])
             self.project_tree.addTopLevelItem(item)
+
+            up_btn = QPushButton("上移")
+            if i > 0:
+                up_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                up_btn.clicked.connect(partial(self.handle_move_project, name, project_list[i - 1]))
+            else:
+                up_btn.setDisabled(True)
+
+            down_btn = QPushButton("下移")
+            if i < len(project_list) - 1:
+                down_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                down_btn.clicked.connect(partial(self.handle_move_project, name, project_list[i + 1]))
+            else:
+                down_btn.setDisabled(True)
+
             create_btn = QPushButton("创建子项目")
             create_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-            create_btn.clicked.connect(partial(self.handle_create_sub_project, name))
+            create_btn.clicked.connect(partial(self.handle_create_sub_project, project_id_map[name]))
+
+            edit_btn = QPushButton("编辑")
+            edit_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            edit_btn.clicked.connect(partial(self.handle_edit_project, name))
+
             delete_btn = QPushButton("删除")
             delete_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             delete_btn.clicked.connect(partial(self.handle_delete_project, name))
+
             action_widget = QWidget()
             action_layout = QHBoxLayout()
+            if up_btn:
+                action_layout.addWidget(up_btn)
+            if down_btn:
+                action_layout.addWidget(down_btn)
+            action_layout.addWidget(edit_btn)
             action_layout.addWidget(delete_btn)
             action_layout.addWidget(create_btn)
             action_layout.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
-            # action_layout.setStretch(0, 0)
-            # action_layout.setStretch(1, 0)
+            action_layout.setAlignment(edit_btn, Qt.AlignLeft)
             action_layout.setAlignment(delete_btn, Qt.AlignLeft)
             action_layout.setAlignment(create_btn, Qt.AlignLeft)
             action_widget.setLayout(action_layout)
             self.project_tree.setItemWidget(item, 1, action_widget)
             top_items[name] = item
 
+        sub_project_map = defaultdict(list)
         for name, parent in get_sub_project():
-            item = QTreeWidgetItem([name, ''])
-            top_items[parent].addChild(item)
-            btn = QPushButton("删除")
-            btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-            btn.clicked.connect(partial(self.handle_delete_sub_project, name))
-            action_widget = QWidget()
-            action_layout = QHBoxLayout()
-            action_layout.addWidget(btn)
-            # action_layout.setStretch(0, 0)
-            action_layout.setAlignment(btn, Qt.AlignLeft)
-            action_widget.setLayout(action_layout)
-            self.project_tree.setItemWidget(item, 1, action_widget)
+            sub_project_map[parent].append(name)
+
+        for parent, sub_project_list in sub_project_map.items():
+            for i, name in enumerate(sub_project_list):
+                item = QTreeWidgetItem([name, ''])
+                top_items[parent].addChild(item)
+
+                up_btn = QPushButton("上移")
+                if i > 0:
+                    up_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                    up_btn.clicked.connect(partial(self.handle_move_sub_project, project_id_map[parent], name, sub_project_list[i - 1]))
+                else:
+                    up_btn.setDisabled(True)
+
+                down_btn = QPushButton("下移")
+                if i < len(sub_project_list) - 1:
+                    down_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                    down_btn.clicked.connect(partial(self.handle_move_sub_project, project_id_map[parent], name, sub_project_list[i + 1]))
+                else:
+                    down_btn.setDisabled(True)
+
+                edit_btn = QPushButton("编辑")
+                edit_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                edit_btn.clicked.connect(partial(self.handle_edit_sub_project, project_id_map[parent], name))
+
+                delete_btn = QPushButton("删除")
+                delete_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                delete_btn.clicked.connect(partial(self.handle_delete_sub_project, project_id_map[parent], name))
+
+                action_widget = QWidget()
+                action_layout = QHBoxLayout()
+                action_layout.addWidget(up_btn)
+                action_layout.addWidget(down_btn)
+                action_layout.addWidget(edit_btn)
+                action_layout.addWidget(delete_btn)
+                action_layout.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
+                action_layout.setAlignment(up_btn, Qt.AlignLeft)
+                action_layout.setAlignment(down_btn, Qt.AlignLeft)
+                action_layout.setAlignment(edit_btn, Qt.AlignLeft)
+                action_layout.setAlignment(delete_btn, Qt.AlignLeft)
+                action_widget.setLayout(action_layout)
+                self.project_tree.setItemWidget(item, 1, action_widget)
 
         self.project_tree.expandAll()
+
+    def handle_move_project(self, name1, name2):
+        swap_project_order(name1, name2)
+        self.load()
+
+    def handle_move_sub_project(self, parent, name1, name2):
+        swap_sub_project_order(parent, name1, name2)
+        self.load()
 
     def handle_create_sub_project(self, parent):
         dialog = CreateSubProjectDialog(parent)
@@ -442,20 +730,47 @@ class ProjectTab(QWidget):
             add_project(name)
             self.load()
 
+    def handle_edit_project(self, name):
+        dialog = EditProjectDialog(name)
+        if dialog.exec() == QDialog.Accepted:
+            self.load()
+
     def handle_add_sub(self):
         name = self.project_name_input.text()
         if name:
             add_project(name)
             self.load()
 
+    def handle_edit_sub_project(self, parent_id, name):
+        dialog = EditSubProjectDialog(parent_id, name)
+        if dialog.exec() == QDialog.Accepted:
+            self.load()
+
     def handle_delete_project(self, name):
-        delete_project(name)
-        self.load()
+        reply = QMessageBox.question(self, "确认", f"确定要删除 {name} 吗？", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.No:
+            return
 
+        try:
+            delete_project(name)
+            self.load()
+        except sqlite3.IntegrityError:
+            QMessageBox.warning(self, "错误", "存在相关子项目，无法删除")
+        except Exception as e:
+            QMessageBox.warning(self, "错误", str(e))
 
-    def handle_delete_sub_project(self, name):
-        delete_sub_project(name)
-        self.load()
+    def handle_delete_sub_project(self, parent, name):
+        reply = QMessageBox.question(self, "确认", f"确定要删除 {name} 吗？", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.No:
+            return
+
+        try:
+            delete_sub_project(parent, name)
+            self.load()
+        except sqlite3.IntegrityError:
+            QMessageBox.warning(self, "错误", "存在相关交易记录，无法删除")
+        except Exception as e:
+            QMessageBox.warning(self, "错误", str(e))
 
 class TransferTab(QWidget):
     def __init__(self):
@@ -552,10 +867,10 @@ class TransferTab(QWidget):
 
     def load_combo(self):
         self.person_input.clear()
-        for name in get_person():
+        for _, name in get_person():
             self.person_input.addItem(name)
         self.project_input.clear()
-        for name in get_project():
+        for _, name in get_project():
             self.project_input.addItem(name)
 
     def load_list(self):
@@ -618,7 +933,7 @@ class TransferTab(QWidget):
         memo = self.memo_input.text()
         try:
             add_transfer(time, person, project, sub_project, kind, amount, memo)
-        except BalanceError as e:
+        except Exception as e:
             QMessageBox.warning(self, "错误", str(e))
             return
         self.load_balance()
@@ -631,9 +946,13 @@ class TransferTab(QWidget):
             self.load_list()
 
     def handle_delete(self, id_):
+        reply = QMessageBox.question(self, "确认", f"确定要删除交易记录吗？", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.No:
+            return
+
         try:
             delete_transfer(id_)
-        except BalanceError as e:
+        except Exception as e:
             QMessageBox.warning(self, "错误", str(e))
             return
         self.load_balance()
@@ -670,28 +989,40 @@ class SummaryTab(QWidget):
         self.btn.clicked.connect(self.export_to_excel)
         self.summary_table = QTableWidget()
         self.summary_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.summary_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        # self.summary_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.btn)
         layout.addWidget(self.summary_table)
         self.setLayout(layout)
 
+    def get_project_order(self):
+        project_list = [name for _, name in get_project()]
+        project_map = defaultdict(list)
+        for sub_project, project in get_sub_project():
+            project_map[project].append(sub_project)
+        r = []
+        for parent in project_list:
+            for sub_project in project_map[parent]:
+                r.append(f'{parent}\n{sub_project}')
+        return r
+
+
     def load(self):
         transfer_list = get_transfer()
 
+        person_order = [name for _, name in get_person()]
         person_summary = defaultdict(lambda: defaultdict(decimal.Decimal))
-        for person in get_person():
+        for person in person_order:
             person_summary[person]['入'] = 0
             person_summary[person]['出'] = 0
 
-        project_summary = defaultdict(decimal.Decimal)
-        for sub_project, project in get_sub_project():
-            project_summary[f'{project}\n{sub_project}'] = 0
+        project_order = self.get_project_order()
+        project_summary = {project: 0 for project in project_order}
 
         summary = defaultdict(decimal.Decimal)
-        for person in get_person():
-            for sub_project, project in get_sub_project():
-                summary[(person, '入', f'{project}\n{sub_project}')] = 0
-                summary[(person, '出', f'{project}\n{sub_project}')] = 0
+        for person in person_order:
+            for project in project_order:
+                summary[(person, '入', project)] = 0
+                summary[(person, '出', project)] = 0
 
         for row, (id_, time, person, project, sub_project, kind, amount, memo) in enumerate(transfer_list):
             amount = decimal.Decimal(amount)
@@ -701,9 +1032,6 @@ class SummaryTab(QWidget):
 
         self.summary_table.clear()
         self.summary_table.clearSpans()
-
-        project_order = sorted(project_summary.keys())
-        person_order = sorted(person_summary.keys())
 
         horizontal_headers = project_order + ['人员统计', '人员合计']
         vertial_headers = []
@@ -763,7 +1091,7 @@ class SummaryTab(QWidget):
 
         # merge adjacent cells with identical value at first row
         project_start_col = 3
-        for col in range(4, self.summary_table.columnCount() + 3):
+        for col in range(4, self.summary_table.columnCount() + 2):
             if ws.cell(row=1, column=col).value != ws.cell(row=1, column=col-1).value:
                 ws.merge_cells(start_row=1, start_column=project_start_col, end_row=1, end_column=col - 1)
                 ws.cell(row=1, column=project_start_col).alignment = openpyxl.styles.Alignment(horizontal='center', vertical='center')
@@ -800,6 +1128,14 @@ class SummaryTab(QWidget):
         ws.cell(row=self.summary_table.rowCount() + 2, column=1, value='项目合计')
         ws.merge_cells(start_row=self.summary_table.rowCount() + 2, start_column=1, end_row=self.summary_table.rowCount() + 2, end_column=2)
         ws.cell(row=self.summary_table.rowCount() + 2, column=1).alignment = openpyxl.styles.Alignment(horizontal='center', vertical='center')
+
+        # merge '人员统计'
+        ws.merge_cells(start_row=1, start_column=self.summary_table.columnCount() + 1, end_row=2, end_column=self.summary_table.columnCount() + 1)
+        ws.cell(row=1, column=self.summary_table.columnCount() + 1).alignment = openpyxl.styles.Alignment(horizontal='center', vertical='center')
+
+        # merge '人员合计'
+        ws.merge_cells(start_row=1, start_column=self.summary_table.columnCount() + 2, end_row=2, end_column=self.summary_table.columnCount() + 2)
+        ws.cell(row=1, column=self.summary_table.columnCount() + 2).alignment = openpyxl.styles.Alignment(horizontal='center', vertical='center')
 
         # merge bottomright 2 cells
         ws.merge_cells(start_row=self.summary_table.rowCount() + 2, start_column=self.summary_table.columnCount() + 1, end_row=self.summary_table.rowCount() + 2, end_column=self.summary_table.columnCount() + 2)
