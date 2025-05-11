@@ -4,20 +4,34 @@ from typing import override
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QTabWidget,
     QTableWidget, QTableWidgetItem, QHBoxLayout, QLineEdit, QFormLayout,
-    QDialog, QDialogButtonBox, QLabel, QMessageBox, QDateTimeEdit, QComboBox, 
+    QDialog, QDialogButtonBox, QLabel, QMessageBox, QDateEdit, QComboBox, 
     QHeaderView, QFrame, QTreeWidget, QTreeWidgetItem, QSizePolicy, QSpacerItem,
-    QFileDialog
+    QFileDialog, QTextEdit
 )
 from PySide6.QtGui import QDoubleValidator, QFont, QDropEvent, QDragMoveEvent, QDragEnterEvent, QDragLeaveEvent, QDrag
 from PySide6.QtCore import Qt
-from PySide6.QtCore import QDateTime
+from PySide6.QtCore import QDate
+from PySide6.QtCore import QObject, Signal
+from PySide6.QtGui import QTextCursor
+
 from collections import defaultdict
 from functools import partial
 import decimal
 import sys
 import openpyxl
+import traceback
 
-conn = sqlite3.connect("ledger.db")
+class LoggingCursor(sqlite3.Cursor):
+    def execute(self, sql, params=()):
+        print(f"[SQL] {sql.strip()}")
+        print(f"    | params: {params}")
+        return super().execute(sql, params)
+
+class LoggingConnection(sqlite3.Connection):
+    def cursor(self, *args, **kwargs):
+        return super().cursor(factory=LoggingCursor)
+
+conn = sqlite3.connect("ledger.db", factory=LoggingConnection)
 cursor = conn.cursor()
 
 def init_db(drop):
@@ -94,7 +108,6 @@ def swap_project_order(name1, name2):
 
 def get_sub_project(parent=None):
     if parent != None:
-        print(parent)
         cursor.execute("SELECT id FROM project WHERE name = ?", (parent,))
         item = cursor.fetchone()
         if item is None:
@@ -140,7 +153,6 @@ def add_project(name):
     if name:
         cursor.execute("SELECT MAX(rank) FROM project")
         item = cursor.fetchone()[0]
-        print(item)
         max_rank = item if item else 0
         cursor.execute("INSERT INTO project (name, rank) VALUES (?, ?)", (name, max_rank + 1))
         conn.commit()
@@ -268,7 +280,7 @@ def update_transfer(id_, time, person, project, sub_project, kind, amount, memo)
         LEFT JOIN person ON transfer.person = person.id
         LEFT JOIN sub_project ON transfer.sub_project = sub_project.id
         LEFT JOIN project ON sub_project.parent = project.id
-        WHERE id = ?
+        WHERE transfer.id = ?
     """, (id_,)).fetchall()[0]
 
     try:
@@ -296,7 +308,6 @@ def get_transfer():
         LEFT JOIN project ON sub_project.parent = project.id
         ORDER BY time DESC
     """
-    print('sql', stmt)
     cursor.execute(stmt)
     return cursor.fetchall()
 
@@ -310,16 +321,27 @@ def filter_transfer(person, project, kind):
         WHERE 1 = 1
     '''
     if person:
-        stmt += f' AND person = "{person}"'
+        stmt += f' AND person.name = "{person}"'
     if project:
-        stmt += f' AND project = "{project}"'
+        stmt += f' AND project.name = "{project}"'
     if kind:
-        stmt += f' AND kind = "{kind}"'
+        stmt += f' AND transfer.kind = "{kind}"'
     stmt += ' ORDER BY time DESC'
-    print('sql', stmt)
     cursor.execute(stmt)
     return cursor.fetchall()
 
+class LazyComboBox(QComboBox):
+    def __init__(self, get_items, parent=None):
+        super().__init__(parent)
+        self.setEditable(True)
+        self.get_items = get_items
+
+    def showPopup(self):
+        current_text = self.currentText()
+        self.clear()
+        self.addItems(self.get_items())
+        self.setEditText(current_text)
+        super().showPopup()
 
 def create_person_combo():
     combo = QComboBox()
@@ -372,7 +394,7 @@ class EditTranferDialog(QDialog):
 
         self.setWindowTitle("编辑")
 
-        self.time_edit = QDateTimeEdit()
+        self.time_edit = QDateEdit()
         self.amount_edit = QLineEdit()
         self.amount_edit.setValidator(QDoubleValidator(0.0, float('inf'), 2))
         self.person_combo = create_person_combo()
@@ -386,7 +408,7 @@ class EditTranferDialog(QDialog):
         self.project_combo.setEditable(True) # allow deleted project
         self.sub_project_combo.setEditable(True) # allow deleted sub project
 
-        self.time_edit.setDateTime(QDateTime.fromString(time, "yyyy-MM-dd HH:mm:ss"))
+        self.time_edit.setDate(QDate.fromString(time, "yyyy-MM-dd"))
         self.amount_edit.setText(str(amount))
         self.person_combo.setCurrentText(person)
         self.project_combo.setCurrentText(project)
@@ -427,7 +449,7 @@ class EditTranferDialog(QDialog):
             self.sub_project_combo.addItem(name)
 
     def handle_save(self):
-        time = self.time_edit.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        time = self.time_edit.date().toString("yyyy-MM-dd")
         person = self.person_combo.currentText()
         project = self.project_combo.currentText()
         sub_project = self.sub_project_combo.currentText()
@@ -438,6 +460,7 @@ class EditTranferDialog(QDialog):
             update_transfer(self.id_, time, person, project, sub_project, kind, amount, memo)
         except Exception as e:
             QMessageBox.warning(self, "错误", str(e))
+            traceback.print_exc()
             return
         self.accept()
 
@@ -514,8 +537,11 @@ class PersonTab(QWidget):
             self.load()
         except sqlite3.IntegrityError:
             QMessageBox.warning(self, "错误", "存在相关交易记录，无法删除")
+            traceback.print_exc()
         except Exception as e:
             QMessageBox.warning(self, "错误", str(e))
+            traceback.print_exc()
+
 
     def handle_edit(self, person_id):
         dialog = EditPersonDialog(person_id)
@@ -756,8 +782,11 @@ class ProjectTab(QWidget):
             self.load()
         except sqlite3.IntegrityError:
             QMessageBox.warning(self, "错误", "存在相关子项目，无法删除")
+            traceback.print_exc()
         except Exception as e:
             QMessageBox.warning(self, "错误", str(e))
+            traceback.print_exc()
+
 
     def handle_delete_sub_project(self, parent, name):
         reply = QMessageBox.question(self, "确认", f"确定要删除 {name} 吗？", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
@@ -769,8 +798,11 @@ class ProjectTab(QWidget):
             self.load()
         except sqlite3.IntegrityError:
             QMessageBox.warning(self, "错误", "存在相关交易记录，无法删除")
+            traceback.print_exc()
         except Exception as e:
             QMessageBox.warning(self, "错误", str(e))
+            traceback.print_exc()
+
 
 class TransferTab(QWidget):
     def __init__(self):
@@ -778,20 +810,18 @@ class TransferTab(QWidget):
         layout = QVBoxLayout()
         form = QFormLayout()
 
-        self.time_input = QDateTimeEdit(QDateTime.currentDateTime())
+        self.time_input = QDateEdit(QDate.currentDate())
         self.time_input.setCalendarPopup(True)
-        self.person_input = QComboBox()
-        self.project_input = QComboBox()
+        self.person_input = LazyComboBox(lambda :[name for _, name in get_person()])
+        self.project_input = LazyComboBox(lambda: [name for _, name in get_project()])
         self.project_balance = QLabel()
-        self.sub_project_input = QComboBox()
+        self.sub_project_input = LazyComboBox(lambda : [name for name, _ in get_sub_project(self.project_input.currentText())])
+        self.sub_project_input.setEditable(True)
         self.kind_input = create_kind_combo()
         self.amount_input = QLineEdit()
         self.amount_input.setValidator(QDoubleValidator(0.0, float('inf'), 2))
         self.memo_input = QLineEdit()
 
-        self.person_input.setEditable(True)
-
-        self.project_input.currentTextChanged.connect(self.load_sub_projects)
         self.project_input.currentTextChanged.connect(self.load_balance)
         self.person_input.currentTextChanged.connect(self.load_balance)
 
@@ -860,19 +890,6 @@ class TransferTab(QWidget):
             content.append(f'{sub_project}: {balance}')
         self.project_balance.setText(', '.join(content))
 
-    def load_sub_projects(self):
-        self.sub_project_input.clear()
-        for name, _ in get_sub_project(self.project_input.currentText()):
-            self.sub_project_input.addItem(name)
-
-    def load_combo(self):
-        self.person_input.clear()
-        for _, name in get_person():
-            self.person_input.addItem(name)
-        self.project_input.clear()
-        for _, name in get_project():
-            self.project_input.addItem(name)
-
     def load_list(self):
         TIME_CELL = 0
         PERSON_CELL = 1
@@ -919,12 +936,11 @@ class TransferTab(QWidget):
             self.transfer_table.setEditTriggers(QTableWidget.NoEditTriggers)
 
     def load(self):
-        self.load_combo()
         self.load_list()
 
 
     def handle_add(self):
-        time = self.time_input.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        time = self.time_input.date().toString("yyyy-MM-dd")
         person = self.person_input.currentText()
         project = self.project_input.currentText()
         sub_project = self.sub_project_input.currentText()
@@ -935,6 +951,7 @@ class TransferTab(QWidget):
             add_transfer(time, person, project, sub_project, kind, amount, memo)
         except Exception as e:
             QMessageBox.warning(self, "错误", str(e))
+            traceback.print_exc()
             return
         self.load_balance()
         self.load_list()
@@ -954,6 +971,7 @@ class TransferTab(QWidget):
             delete_transfer(id_)
         except Exception as e:
             QMessageBox.warning(self, "错误", str(e))
+            traceback.print_exc()
             return
         self.load_balance()
         self.load_list()
@@ -963,7 +981,6 @@ class TransferTab(QWidget):
         file_name, _ = QFileDialog.getSaveFileName(self, "导出为 Excel 文件", "", "Excel Files (*.xlsx);;All Files (*)", options=options)
 
         if not file_name:
-            print('file name not specified')
             return
 
         wb = excel_from_table(self.transfer_table, "流水记录", False)
@@ -1061,21 +1078,20 @@ class SummaryTab(QWidget):
             self.summary_table.setItem(x * 2 + 1, len(project_summary), QTableWidgetItem(str(spend)))
             self.summary_table.setItem(x * 2, len(project_summary) + 1, QTableWidgetItem(str(income - spend)))
             self.summary_table.setSpan(x * 2, len(project_summary) + 1, 2, 1)
-            print('set span', x * 2, len(project_summary) + 1, 2, 1)
+            # print('set span', x * 2, len(project_summary) + 1, 2, 1)
 
         for col, project in enumerate(project_order):
             self.summary_table.setItem(2 * len(person_summary), col, QTableWidgetItem(str(project_summary[project])))
 
         self.summary_table.setItem(len(vertial_headers) - 1, len(project_summary), QTableWidgetItem(str(sum(project_summary.values()))))
         self.summary_table.setSpan(len(vertial_headers) - 1, len(project_summary), 1, 2)
-        print('set span', len(vertial_headers) - 1, len(project_summary), 1, 2)
+        # print('set span', len(vertial_headers) - 1, len(project_summary), 1, 2)
 
     def export_to_excel(self):
         options = QFileDialog.Options()
         file_name, _ = QFileDialog.getSaveFileName(self, "导出为 Excel 文件", "", "Excel Files (*.xlsx);;All Files (*)", options=options)
 
         if not file_name:
-            print('file name not specified')
             return
 
         wb = openpyxl.Workbook()
@@ -1179,10 +1195,41 @@ class SettingTab(QWidget):
     def load(self):
         pass
 
+class EmittingStream(QObject):
+    text_written = Signal(str)
+
+    def write(self, text):
+        self.text_written.emit(str(text))
+
+    def flush(self):
+        pass
+
+class DebugTab(QTextEdit):
+    def __init__(self):
+        super().__init__()
+        self.setReadOnly(True)
+
+        print('redirecting stdout and stderr to QTextEdit')
+
+        sys.stdout = EmittingStream()
+        sys.stderr = EmittingStream()
+        sys.stdout.text_written.connect(self.append_text)
+        sys.stderr.text_written.connect(self.append_text)
+
+    def append_text(self, text):
+        self.moveCursor(QTextCursor.End)
+        self.insertPlainText(text)
+
+    def load(self):
+        pass
+
 
 class LedgerApp(QWidget):
     def __init__(self):
         super().__init__()
+
+        debug_tab = DebugTab()
+
         self.setMinimumSize(1000, 800)
         self.setWindowTitle("账本应用")
 
@@ -1194,6 +1241,7 @@ class LedgerApp(QWidget):
         self.tabs.addTab(TransferTab(), "流水")
         self.tabs.addTab(SummaryTab(), "统计")
         self.tabs.addTab(SettingTab(), "设置")
+        self.tabs.addTab(debug_tab, "调试")
 
         self.tabs.currentChanged.connect(self.on_tab_changed)
 
