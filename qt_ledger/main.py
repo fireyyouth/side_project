@@ -176,17 +176,28 @@ def update_sub_project(parent, name, new_name):
         conn.commit()
 
 def delete_person(person):
-    cursor.execute("DELETE FROM person WHERE name=?", (person,))
-    conn.commit()
+    try:
+        cursor.execute("DELETE FROM person WHERE name=?", (person,))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise
 
 def delete_project(project):
-    cursor.execute("DELETE FROM project WHERE name=?", (project,))
-    conn.commit()
-
+    try:
+        cursor.execute("DELETE FROM project WHERE name=?", (project,))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise
 
 def delete_sub_project(project, sub_project):
-    cursor.execute("DELETE FROM sub_project WHERE parent=? AND name=?", (project, sub_project))
-    conn.commit()
+    try:
+        cursor.execute("DELETE FROM sub_project WHERE parent=? AND name=?", (project, sub_project))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise
 
 class InvalidInputError(Exception):
     pass
