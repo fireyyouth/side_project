@@ -269,7 +269,7 @@ def delete_transfer(id_):
         LEFT JOIN person ON transfer.person = person.id
         LEFT JOIN sub_project ON transfer.sub_project = sub_project.id
         LEFT JOIN project ON sub_project.parent = project.id
-        WHERE id = ?
+        WHERE transfer.id = ?
     """, (id_,)).fetchall()[0]
 
     try:
@@ -1239,7 +1239,7 @@ class LedgerApp(QWidget):
     def __init__(self):
         super().__init__()
 
-        debug_tab = DebugTab()
+        # debug_tab = DebugTab()
 
         self.setMinimumSize(1000, 800)
         self.setWindowTitle("账本应用")
@@ -1252,7 +1252,7 @@ class LedgerApp(QWidget):
         self.tabs.addTab(TransferTab(), "流水")
         self.tabs.addTab(SummaryTab(), "统计")
         self.tabs.addTab(SettingTab(), "设置")
-        self.tabs.addTab(debug_tab, "调试")
+        # self.tabs.addTab(debug_tab, "调试")
 
         self.tabs.currentChanged.connect(self.on_tab_changed)
 
