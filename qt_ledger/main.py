@@ -322,7 +322,7 @@ def get_transfer():
     cursor.execute(stmt)
     return cursor.fetchall()
 
-def filter_transfer(person, project, kind):
+def filter_transfer(person, project, sub_project, kind):
     stmt = '''
         SELECT transfer.id, transfer.time, person.name, project.name, sub_project.name, transfer.kind, transfer.amount, transfer.memo
         FROM transfer
@@ -332,9 +332,11 @@ def filter_transfer(person, project, kind):
         WHERE 1 = 1
     '''
     if person:
-        stmt += f' AND person.name = "{person}"'
+        stmt += f' AND person.name LIKE "%{person}%"'
     if project:
-        stmt += f' AND project.name = "{project}"'
+        stmt += f' AND project.name LIKE "%{project}%"'
+    if sub_project:
+        stmt += f' AND sub_project.name LIKE "%{sub_project}%"'
     if kind:
         stmt += f' AND transfer.kind = "{kind}"'
     stmt += ' ORDER BY time DESC'
@@ -373,6 +375,22 @@ def create_kind_combo(need_blank=False):
     combo.addItems(["入账", "出账"])
     return combo
 
+def question_box(title, text):
+    msg_box = QMessageBox()
+    msg_box.setIcon(QMessageBox.Question)
+    msg_box.setWindowTitle(title)
+    msg_box.setText(text)
+
+    # Add custom buttons
+    yes_button = msg_box.addButton("是", QMessageBox.YesRole)
+    no_button = msg_box.addButton("否", QMessageBox.NoRole)
+    msg_box.setDefaultButton(no_button)
+
+    # Execute the dialog
+    msg_box.exec()
+
+    # Determine which button was clicked
+    return msg_box.clickedButton() == yes_button
 
 def excel_from_table(table: QTableWidget, title, export_vertical_header):
     wb = openpyxl.Workbook()
@@ -414,7 +432,6 @@ class EditTranferDialog(QDialog):
         self.kind_combo = create_kind_combo()
         self.memo_edit = QLineEdit()
 
-        self.load_sub_projects()
         self.person_combo.setEditable(True) # allow deleted person
         self.project_combo.setEditable(True) # allow deleted project
         self.sub_project_combo.setEditable(True) # allow deleted sub project
@@ -427,6 +444,8 @@ class EditTranferDialog(QDialog):
         self.kind_combo.setCurrentText(kind)
         self.memo_edit.setText(memo)
         
+        self.load_sub_projects()
+
         self.project_combo.currentTextChanged.connect(self.load_sub_projects)
 
         form_layout = QVBoxLayout()
@@ -445,7 +464,9 @@ class EditTranferDialog(QDialog):
         form_layout.addWidget(QLabel("备注:"))
         form_layout.addWidget(self.memo_edit)
 
-        button_box = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        button_box = QDialogButtonBox()
+        button_box.addButton(QDialogButtonBox.Save).setText("保存")
+        button_box.addButton(QDialogButtonBox.Cancel).setText("取消")
         button_box.accepted.connect(self.handle_save)
         button_box.rejected.connect(self.reject)
 
@@ -539,8 +560,7 @@ class PersonTab(QWidget):
             self.person_table.setCellWidget(row, 1, action_widget)
 
     def handle_delete(self, name):
-        reply = QMessageBox.question(self, "确认", f"确定要删除 {name} 吗？", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply == QMessageBox.No:
+        if not question_box("确认", f"确定要删除 {name} 吗？"):
             return
 
         try:
@@ -784,8 +804,7 @@ class ProjectTab(QWidget):
             self.load()
 
     def handle_delete_project(self, name):
-        reply = QMessageBox.question(self, "确认", f"确定要删除 {name} 吗？", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply == QMessageBox.No:
+        if not question_box("确认", f"确定要删除 {name} 吗？"):
             return
 
         try:
@@ -800,8 +819,7 @@ class ProjectTab(QWidget):
 
 
     def handle_delete_sub_project(self, parent, name):
-        reply = QMessageBox.question(self, "确认", f"确定要删除 {name} 吗？", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply == QMessageBox.No:
+        if not question_box("确认", f"确定要删除 {name} 吗？"):
             return
 
         try:
@@ -855,6 +873,7 @@ class TransferTab(QWidget):
         filter_bar = QHBoxLayout()
         self.person_filter = QLineEdit()
         self.project_filter = QLineEdit()
+        self.sub_project_filter = QLineEdit()
         self.kind_filter = create_kind_combo(True)
 
         filter_btn = QPushButton("过滤")
@@ -862,10 +881,10 @@ class TransferTab(QWidget):
         export_btn = QPushButton('导出为 excel')
         export_btn.clicked.connect(self.export_to_excel)
 
-        self.filters = ("", "", "")
+        self.filters = ("", "", "", "")
         self.filters_label = QLabel()
         def handle_filter():
-            self.filters = (self.person_filter.text(), self.project_filter.text(), self.kind_filter.currentText())
+            self.filters = (self.person_filter.text(), self.project_filter.text(), self.sub_project_filter.text(), self.kind_filter.currentText())
             self.load()
         filter_btn.clicked.connect(handle_filter)
 
@@ -873,6 +892,8 @@ class TransferTab(QWidget):
         filter_bar.addWidget(self.person_filter)
         filter_bar.addWidget(QLabel("项目:"))
         filter_bar.addWidget(self.project_filter)
+        filter_bar.addWidget(QLabel("子项目:"))
+        filter_bar.addWidget(self.sub_project_filter)
         filter_bar.addWidget(QLabel("类型:"))
         filter_bar.addWidget(self.kind_filter)
         filter_bar.addWidget(filter_btn)
@@ -913,7 +934,7 @@ class TransferTab(QWidget):
 
         rows = filter_transfer(*self.filters)
 
-        if self.filters != ("", "", ""):
+        if self.filters != ("", "", "", ""):
             self.filters_label.setText(f"{len(rows)} 条结果, 过滤条件: {','.join([x for x in self.filters if x])}")
         else:
             self.filters_label.setText(f"{len(rows)} 条结果, 未过滤")
@@ -974,8 +995,7 @@ class TransferTab(QWidget):
             self.load_list()
 
     def handle_delete(self, id_):
-        reply = QMessageBox.question(self, "确认", f"确定要删除交易记录吗？", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply == QMessageBox.No:
+        if not question_box("确认", "确定要删除交易记录吗？"):
             return
 
         try:
